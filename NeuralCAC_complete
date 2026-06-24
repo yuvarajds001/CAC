@@ -1,0 +1,503 @@
+# =============================================================================
+# NEURALCAC — COMPLETE ALL-IN-ONE SCRIPT
+# Runs grid search then baselines and prints one final comparison table.
+# Just change DATA_PATH and run:  python NeuralCAC_complete.py
+# =============================================================================
+#
+# ALL BUGS FIXED:
+#   FIX-1  AM-Softmax sign:        + alpha * L_am  (was minus → loss→ -170)
+#   FIX-2  Consistent val/test:    both use distance scores during training
+#   FIX-3  Empty cluster fallback: distance scores instead of 0.0
+#   FIX-4  AMSoftmax weight init:  xavier_uniform_(weight) not unsqueeze(0)
+#   FIX-5  Grid search winner:     chosen by val_auc, not test_auc
+#   FIX-6  Patient-level split:    loads X_train/val/test.npy from preprocess
+#   FIX-7  Feature dim auto:       INPUT_DIM from data shape (120 or 60)
+#   FIX-8  MLP convergence:        max_iter=500 (was 100)
+#   FIX-9  Baseline fallback:      global LR instead of 0.0 for empty clusters
+#   FIX-10 K selection baselines:  try K=2..5 and pick best by val AUC
+#   FIX-11 DCN input_dim:          auto-detected (was hardcoded 60)
+
+DATA_PATH = "/home/Yuvaraj/Documents/ptbxl_processed"
+
+import os, warnings
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import roc_auc_score
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+warnings.filterwarnings("ignore")
+torch.manual_seed(42)
+np.random.seed(42)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — LOAD DATA
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n" + "="*65)
+print("SECTION 1 — LOAD DATA")
+print("="*65)
+
+new_files = all(
+    os.path.exists(os.path.join(DATA_PATH, f))
+    for f in ["X_train.npy","X_val.npy","X_test.npy",
+              "y_train.npy","y_val.npy","y_test.npy"]
+)
+
+if new_files:
+    print("  Loading pre-split patient-level data...")
+    X_train = np.load(os.path.join(DATA_PATH,"X_train.npy")).astype(np.float32)
+    X_val   = np.load(os.path.join(DATA_PATH,"X_val.npy")).astype(np.float32)
+    X_test  = np.load(os.path.join(DATA_PATH,"X_test.npy")).astype(np.float32)
+    y_train = np.load(os.path.join(DATA_PATH,"y_train.npy")).astype(np.float32)
+    y_val   = np.load(os.path.join(DATA_PATH,"y_val.npy")).astype(np.float32)
+    y_test  = np.load(os.path.join(DATA_PATH,"y_test.npy")).astype(np.float32)
+else:
+    print("  Pre-split files not found — using recording-level fallback split.")
+    X = np.load(os.path.join(DATA_PATH,"X_static.npy")).astype(np.float32)
+    y = np.load(os.path.join(DATA_PATH,"y.npy")).astype(np.float32)
+    X_tv,X_test,y_tv,y_test = train_test_split(X,y,test_size=0.25,
+                                                random_state=42,stratify=y)
+    X_train,X_val,y_train,y_val = train_test_split(X_tv,y_tv,test_size=0.20,
+                                                    random_state=42,stratify=y_tv)
+    sc = StandardScaler()
+    X_train = sc.fit_transform(X_train).astype(np.float32)
+    X_val   = sc.transform(X_val).astype(np.float32)
+    X_test  = sc.transform(X_test).astype(np.float32)
+
+INPUT_DIM = X_train.shape[1]   # 120 new / 60 old — auto detected (FIX-7, FIX-11)
+print(f"  Train:{X_train.shape[0]}  Val:{X_val.shape[0]}  Test:{X_test.shape[0]}")
+print(f"  Feature dim: {INPUT_DIM}  |  Positive rate: {y_train.mean():.3f}")
+
+# Move to tensors
+X_train_t = torch.tensor(X_train).to(DEVICE)
+X_val_t   = torch.tensor(X_val).to(DEVICE)
+X_test_t  = torch.tensor(X_test).to(DEVICE)
+y_train_t = torch.tensor(y_train).to(DEVICE)
+y_val_t   = torch.tensor(y_val).to(DEVICE)
+y_test_t  = torch.tensor(y_test).to(DEVICE)
+
+final_results = {}   # method → test AUC  (filled by both sections)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — MODEL DEFINITIONS  (shared by NeuralCAC and DCN baseline)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Encoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, embed_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.BatchNorm1d(embed_dim),
+            nn.ReLU(),
+        )
+    def forward(self, x): return self.net(x)
+
+
+class Decoder(nn.Module):
+    def __init__(self, embed_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+    def forward(self, z): return self.net(z)
+
+
+class LocalClassifier(nn.Module):
+    def __init__(self, embed_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, 32), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(32, 1), nn.Sigmoid(),
+        )
+    def forward(self, z): return self.net(z).squeeze(-1)
+
+
+class AMSoftmaxLoss(nn.Module):
+    """
+    Additive Margin Softmax loss.
+    FIX-4: weight init on 2-D tensor (original used unsqueeze → wrong shape).
+    """
+    def __init__(self, embed_dim=64, num_classes=2, scale=30.0, margin=0.35):
+        super().__init__()
+        self.scale  = scale
+        self.margin = margin
+        self.weight = nn.Parameter(torch.randn(num_classes, embed_dim))
+        nn.init.xavier_uniform_(self.weight)   # FIX-4
+    def forward(self, z, labels):
+        z_norm    = nn.functional.normalize(z, dim=1)
+        w_norm    = nn.functional.normalize(self.weight, dim=1)
+        cos_theta = z_norm @ w_norm.T
+        one_hot   = torch.zeros_like(cos_theta)
+        one_hot.scatter_(1, labels.long().unsqueeze(1), 1.0)
+        logits = self.scale * (cos_theta - one_hot * self.margin)
+        return nn.functional.cross_entropy(logits, labels.long())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — NEURALCAC TRAINING FUNCTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def train_neuralcac(K, alpha, beta,
+                    epochs=60, patience=8, lr=2e-3,
+                    batch_size=128, delta=1e-8,
+                    local_epochs=80, verbose=False):
+    """
+    Returns (test_auc, val_auc, cluster_aucs).
+
+    Key fixes vs original:
+      FIX-1  loss sign: + alpha * L_am  (was minus)
+      FIX-3  empty cluster fallback to distance scores
+      FIX-5  checkpoint selected by val_auc
+    """
+    EMBED   = 64
+    HIDDEN  = max(64, INPUT_DIM // 2)
+
+    encoder    = Encoder(INPUT_DIM, HIDDEN, EMBED).to(DEVICE)
+    decoder    = Decoder(EMBED, HIDDEN, INPUT_DIM).to(DEVICE)
+    am_loss_fn = AMSoftmaxLoss(EMBED, 2, 30.0, 0.35).to(DEVICE)
+
+    params    = (list(encoder.parameters()) +
+                 list(decoder.parameters()) +
+                 list(am_loss_fn.parameters()))
+    optimizer = optim.Adam(params, lr=lr, weight_decay=1e-4)
+    loader    = DataLoader(TensorDataset(X_train_t, y_train_t),
+                           batch_size=batch_size, shuffle=True)
+
+    # ── Phase 1: pretrain autoencoder ──────────────────────────────────────
+    for _ in range(15):
+        encoder.train(); decoder.train()
+        for xb, _ in loader:
+            z    = encoder(xb)
+            loss = nn.functional.mse_loss(decoder(z), xb)
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+    # ── Phase 2: init centroids via KMeans ─────────────────────────────────
+    with torch.no_grad():
+        Z0 = encoder(X_train_t).cpu().numpy()
+    km        = KMeans(n_clusters=K, n_init=10, random_state=42)
+    km.fit(Z0)
+    centroids = torch.tensor(km.cluster_centers_, dtype=torch.float32).to(DEVICE)
+
+    # ── Phase 3: joint training ─────────────────────────────────────────────
+    best_val_auc, best_enc_state, best_centroids = 0.0, None, centroids.clone()
+    pat = 0
+
+    for epoch in range(epochs):
+        encoder.train(); decoder.train(); am_loss_fn.train()
+        for xb, yb in loader:
+            z      = encoder(xb)
+            L_rec  = nn.functional.mse_loss(decoder(z), xb)
+
+            dists  = torch.cdist(z, centroids)
+            asgn   = dists.argmin(dim=1)
+            L_clu  = torch.tensor(0.0, device=DEVICE)
+            for j in range(K):
+                mask = (asgn == j)
+                if mask.sum() > 1:
+                    zj   = z[mask]
+                    sse  = ((zj - centroids[j])**2).sum(dim=1).mean()
+                    L_clu += sse / (zj.shape[0] - 1 + delta)
+
+            L_am = am_loss_fn(z, yb)
+
+            # FIX-1: correct sign — minimising L_am maximises class separation
+            loss = L_rec + beta * L_clu + alpha * L_am
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        # Update centroids
+        with torch.no_grad():
+            Za   = encoder(X_train_t)
+            aasgn = torch.cdist(Za, centroids).argmin(dim=1)
+            for j in range(K):
+                m = (aasgn == j)
+                if m.sum() > 0:
+                    centroids[j] = Za[m].mean(dim=0)
+
+        # Validate with distance scores (fast, consistent)
+        encoder.eval()
+        with torch.no_grad():
+            Zv     = encoder(X_val_t)
+            scores = -torch.cdist(Zv, centroids).min(dim=1).values.cpu().numpy()
+        try:    val_auc = roc_auc_score(y_val, scores)
+        except: val_auc = 0.5
+
+        if val_auc > best_val_auc:
+            best_val_auc   = val_auc
+            best_enc_state = {k: v.clone() for k, v in encoder.state_dict().items()}
+            best_centroids = centroids.clone()
+            pat = 0
+        else:
+            pat += 1
+            if pat >= patience: break
+
+    encoder.load_state_dict(best_enc_state)
+    centroids = best_centroids
+
+    # ── Phase 4: per-cluster local classifiers ──────────────────────────────
+    encoder.eval()
+    with torch.no_grad():
+        Z_tr  = encoder(X_train_t)
+        Z_te  = encoder(X_test_t)
+        atr   = torch.cdist(Z_tr, centroids).argmin(dim=1)
+        ate   = torch.cdist(Z_te, centroids).argmin(dim=1)
+
+    # FIX-3: start with distance-based fallback, overwrite where classifier trained
+    all_preds = -torch.cdist(Z_te, centroids).min(dim=1).values.cpu().numpy()
+
+    bce  = nn.BCELoss()
+    clfs = nn.ModuleList([LocalClassifier(EMBED).to(DEVICE) for _ in range(K)])
+    cluster_aucs = []
+
+    for j in range(K):
+        mtr = (atr == j); mte = (ate == j)
+        if mtr.sum() < 10 or mte.sum() < 2:
+            cluster_aucs.append(None)
+            continue
+
+        Zj_tr = Z_tr[mtr].detach();  yj_tr = y_train_t[mtr]
+        Zj_te = Z_te[mte].detach();  yj_te = y_test_t[mte].cpu().numpy()
+
+        clf     = clfs[j]
+        clf_opt = optim.Adam(clf.parameters(), lr=1e-3, weight_decay=1e-4)
+        n_ep    = max(20, min(local_epochs, len(Zj_tr) // 2))
+
+        ll = DataLoader(TensorDataset(Zj_tr, yj_tr),
+                        batch_size=min(64, len(Zj_tr)), shuffle=True)
+        clf.train()
+        for _ in range(n_ep):
+            for zb, yb in ll:
+                p = clf(zb)
+                clf_opt.zero_grad(); bce(p, yb).backward(); clf_opt.step()
+
+        clf.eval()
+        with torch.no_grad():
+            pj = clf(Zj_te).cpu().numpy()
+        try:    auc = roc_auc_score(yj_te, pj)
+        except: auc = 0.5
+        cluster_aucs.append(auc)
+
+        # FIX-3: overwrite fallback with classifier prediction
+        mte_np = mte.cpu().numpy().astype(bool)
+        all_preds[mte_np] = pj
+
+    global_auc = roc_auc_score(y_test, all_preds)
+    sizes      = [(ate == j).sum().item() for j in range(K)]
+
+    if verbose:
+        fmt = [round(a,4) if a is not None else None for a in cluster_aucs]
+        print(f"    K={K} α={alpha} β={beta} → "
+              f"val:{best_val_auc:.4f}  test:{global_auc:.4f}  "
+              f"clusters:{sizes}  local:{fmt}")
+
+    return global_auc, best_val_auc, cluster_aucs
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — NEURALCAC GRID SEARCH
+# FIX-5: best config chosen by val_auc, test_auc reported once only
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n" + "="*65)
+print("SECTION 2 — NEURALCAC GRID SEARCH  (val-AUC selection)")
+print("="*65)
+
+K_values     = [2, 3, 4, 5]
+alpha_values = [0.1, 0.5, 1.0, 2.0]
+beta_values  = [0.5, 1.0, 2.0]
+
+best_val_nc, best_cfg, all_gs = 0.0, {}, []
+
+for K in K_values:
+    for alpha in alpha_values:
+        for beta in beta_values:
+            t_auc, v_auc, c_aucs = train_neuralcac(
+                K=K, alpha=alpha, beta=beta, verbose=True)
+            all_gs.append({"K":K,"alpha":alpha,"beta":beta,
+                           "val_auc":round(v_auc,4),"test_auc":round(t_auc,4)})
+            if v_auc > best_val_nc:             # FIX-5
+                best_val_nc = v_auc
+                best_cfg    = {"K":K,"alpha":alpha,"beta":beta,"test_auc":t_auc}
+
+gs_df = pd.DataFrame(all_gs).sort_values("val_auc", ascending=False)
+gs_df.to_csv(os.path.join(DATA_PATH,"neuralcac_grid_search.csv"), index=False)
+
+print("\n" + "="*65)
+print("GRID SEARCH TOP 10  (sorted by val AUC)")
+print("="*65)
+print(f"  {'K':>3} {'alpha':>7} {'beta':>6} {'Val AUC':>9} {'Test AUC':>10}")
+print("  " + "-"*45)
+for _, row in gs_df.head(10).iterrows():
+    print(f"  {int(row.K):>3} {row.alpha:>7.2f} {row.beta:>6.1f} "
+          f"{row.val_auc:>9.4f} {row.test_auc:>10.4f}")
+print("="*65)
+print(f"\n  BEST (val) : K={best_cfg['K']} α={best_cfg['alpha']} β={best_cfg['beta']}")
+print(f"  Val  AUC   : {best_val_nc:.4f}")
+print(f"  Test AUC   : {best_cfg['test_auc']:.4f}  ← reported once for val-selected config")
+
+nc_label = (f"NeuralCAC best "
+            f"(K={best_cfg['K']} α={best_cfg['alpha']} β={best_cfg['beta']})")
+final_results[nc_label] = best_cfg["test_auc"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — BASELINES
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n" + "="*65)
+print("SECTION 3 — BASELINES")
+print("="*65)
+
+# ── Helper: cluster-then-predict with fallback ──────────────────────────────
+def cluster_predict(Xtr, ytr, Xva, yva, Xte, yte,
+                    atr, ava, ate, K, clf_fn):
+    """
+    FIX-9: global LR fallback instead of 0.0 for empty/tiny clusters.
+    FIX-10: caller loops K=2..5 and picks best by val AUC.
+    """
+    fb = LogisticRegression(max_iter=1000, random_state=42).fit(Xtr, ytr)
+    vp = fb.predict_proba(Xva)[:,1].copy()
+    tp = fb.predict_proba(Xte)[:,1].copy()
+    for j in range(K):
+        mtr=(atr==j); mva=(ava==j); mte=(ate==j)
+        if mtr.sum() < 10: continue
+        clf = clf_fn().fit(Xtr[mtr], ytr[mtr])
+        if mva.sum() >= 2: vp[mva] = clf.predict_proba(Xva[mva])[:,1]
+        if mte.sum() >= 2: tp[mte] = clf.predict_proba(Xte[mte])[:,1]
+    return roc_auc_score(yva, vp), roc_auc_score(yte, tp)
+
+
+# ── Baseline 1: Single LR ───────────────────────────────────────────────────
+print("\n[B1] Single Logistic Regression (no clustering)...")
+lr_clf = LogisticRegression(max_iter=1000, random_state=42)
+lr_clf.fit(X_train, y_train)
+v = roc_auc_score(y_val,  lr_clf.predict_proba(X_val)[:,1])
+t = roc_auc_score(y_test, lr_clf.predict_proba(X_test)[:,1])
+final_results["Single LR (no clustering)"] = t
+print(f"  Val:{v:.4f}  Test:{t:.4f}")
+
+
+# ── Baseline 2: Single MLP ──────────────────────────────────────────────────
+# FIX-8: max_iter=500 was 100 → ConvergenceWarning in original logs
+print("\n[B2] Single MLP (no clustering)...")
+mlp_clf = MLPClassifier(hidden_layer_sizes=(64,32), max_iter=500,
+                        random_state=42, early_stopping=True,
+                        learning_rate_init=1e-3)
+mlp_clf.fit(X_train, y_train)
+v = roc_auc_score(y_val,  mlp_clf.predict_proba(X_val)[:,1])
+t = roc_auc_score(y_test, mlp_clf.predict_proba(X_test)[:,1])
+final_results["Single MLP (no clustering)"] = t
+print(f"  Val:{v:.4f}  Test:{t:.4f}")
+
+
+# ── Baseline 3: KMeans + LR  (FIX-10: best K by val AUC) ──────────────────
+print("\n[B3] KMeans + LR (best K ∈ {2,3,4,5} by val AUC)...")
+best_v, best_t, best_K = 0.0, 0.0, -1
+for K in [2,3,4,5]:
+    km = KMeans(n_clusters=K, n_init=10, random_state=42).fit(X_train)
+    v, t = cluster_predict(
+        X_train,y_train, X_val,y_val, X_test,y_test,
+        km.predict(X_train), km.predict(X_val), km.predict(X_test), K,
+        lambda: LogisticRegression(max_iter=1000, random_state=42))
+    print(f"    K={K}  val:{v:.4f}  test:{t:.4f}")
+    if v > best_v: best_v,best_t,best_K = v,t,K
+final_results[f"KMeans + LR  (best K={best_K})"] = best_t
+print(f"  Best K={best_K}  Val:{best_v:.4f}  Test:{best_t:.4f}")
+
+
+# ── Baseline 4: KMeans + MLP  (FIX-10) ─────────────────────────────────────
+print("\n[B4] KMeans + MLP (best K ∈ {2,3,4,5} by val AUC)...")
+best_v, best_t, best_K = 0.0, 0.0, -1
+for K in [2,3,4,5]:
+    km = KMeans(n_clusters=K, n_init=10, random_state=42).fit(X_train)
+    v, t = cluster_predict(
+        X_train,y_train, X_val,y_val, X_test,y_test,
+        km.predict(X_train), km.predict(X_val), km.predict(X_test), K,
+        lambda: MLPClassifier(hidden_layer_sizes=(32,), max_iter=500,
+                              random_state=42, learning_rate_init=1e-3))
+    print(f"    K={K}  val:{v:.4f}  test:{t:.4f}")
+    if v > best_v: best_v,best_t,best_K = v,t,K
+final_results[f"KMeans + MLP (best K={best_K})"] = best_t
+print(f"  Best K={best_K}  Val:{best_v:.4f}  Test:{best_t:.4f}")
+
+
+# ── Baseline 5: DCN-Z + LR  (FIX-11: input_dim auto) ───────────────────────
+print("\n[B5] DCN-Z + LR (deep cluster, best K ∈ {2,3,4,5} by val AUC)...")
+
+class DCN(nn.Module):
+    def __init__(self, input_dim, embed_dim=64):
+        super().__init__()
+        h = max(64, input_dim//2)
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim,h), nn.BatchNorm1d(h), nn.ReLU(),
+            nn.Linear(h, embed_dim), nn.BatchNorm1d(embed_dim), nn.ReLU())
+        self.decoder = nn.Sequential(
+            nn.Linear(embed_dim,h), nn.ReLU(), nn.Linear(h, input_dim))
+    def forward(self, x):
+        z = self.encoder(x); return z, self.decoder(z)
+
+dcn     = DCN(INPUT_DIM, 64).to(DEVICE)   # FIX-11: auto dim
+dcn_opt = optim.Adam(dcn.parameters(), lr=2e-3)
+dl      = DataLoader(TensorDataset(X_train_t), batch_size=128, shuffle=True)
+
+print("  Pretraining DCN autoencoder (30 epochs)...")
+for _ in range(30):
+    dcn.train()
+    for (xb,) in dl:
+        z, xr = dcn(xb)
+        dcn_opt.zero_grad(); nn.functional.mse_loss(xr, xb).backward(); dcn_opt.step()
+
+dcn.eval()
+with torch.no_grad():
+    Ztr_d = dcn.encoder(X_train_t).cpu().numpy()
+    Zva_d = dcn.encoder(X_val_t).cpu().numpy()
+    Zte_d = dcn.encoder(X_test_t).cpu().numpy()
+
+best_v, best_t, best_K = 0.0, 0.0, -1
+for K in [2,3,4,5]:
+    km = KMeans(n_clusters=K, n_init=10, random_state=42).fit(Ztr_d)
+    v, t = cluster_predict(
+        Ztr_d,y_train, Zva_d,y_val, Zte_d,y_test,
+        km.predict(Ztr_d), km.predict(Zva_d), km.predict(Zte_d), K,
+        lambda: LogisticRegression(max_iter=1000, random_state=42))
+    print(f"    K={K}  val:{v:.4f}  test:{t:.4f}")
+    if v > best_v: best_v,best_t,best_K = v,t,K
+final_results[f"DCN-Z + LR   (best K={best_K})"] = best_t
+print(f"  Best K={best_K}  Val:{best_v:.4f}  Test:{best_t:.4f}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — FINAL COMPARISON TABLE
+# ═══════════════════════════════════════════════════════════════════════════════
+best_overall = max(final_results.values())
+
+print("\n" + "="*68)
+print("FINAL COMPARISON TABLE — ECG MI SUBTYPING (PTB-XL)")
+print("="*68)
+print(f"  {'Method':<48} {'Test AUC':>8}")
+print("  " + "-"*58)
+for method, auc in sorted(final_results.items(), key=lambda x: x[1]):
+    marker = "  ◄ BEST" if auc == best_overall else ""
+    print(f"  {method:<48} {auc:>8.4f}{marker}")
+print("="*68)
+
+# Save
+out = pd.DataFrame(list(final_results.items()),
+                   columns=["Method","Test AUC"]).sort_values("Test AUC",ascending=False)
+csv_path = os.path.join(DATA_PATH,"final_comparison.csv")
+out.to_csv(csv_path, index=False)
+print(f"\n  Saved to: {csv_path}")
+print("\n  ALL DONE.")
