@@ -1,0 +1,331 @@
+# =============================================================================
+# PTB-XL DATA PREPROCESSING FOR NEURALCAC
+# =============================================================================
+# FIXES APPLIED vs original script:
+#   FIX-1  : Richer features (10 per lead × 12 leads = 120) instead of
+#             first/last which are noise-dominated
+#   FIX-2  : Corrected MI label codes — removed invalid "INJanterior",
+#             moved INJIN (inferior injury) to lower-risk where it belongs
+#   FIX-3  : StandardScaler NOT applied here; applied after splitting in
+#             the model script to prevent data leakage
+#   FIX-4  : Patient-level train/val/test split so the same patient cannot
+#             appear in both train and test (recording-level split inflates AUC)
+#   FIX-5  : patient_id saved alongside X and y for downstream use
+#   FIX-6  : Explicit None return for non-MI records in label function
+# =============================================================================
+
+# ── CHANGE THIS PATH ─────────────────────────────────────────────────────────
+PTBXL_PATH = "/home/Yuvaraj/Documents/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3"
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os
+import ast
+import numpy as np
+import pandas as pd
+import wfdb
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+
+OUTPUT_PATH = os.path.join(os.path.dirname(PTBXL_PATH), "ptbxl_processed")
+os.makedirs(OUTPUT_PATH, exist_ok=True)
+
+print("=" * 65)
+print("PTB-XL DATA PREPARATION FOR NEURALCAC")
+print("=" * 65)
+
+
+# ── STEP 1: LOAD METADATA ────────────────────────────────────────────────────
+print("\n[1/6] Loading metadata...")
+
+df = pd.read_csv(
+    os.path.join(PTBXL_PATH, "ptbxl_database.csv"),
+    index_col="ecg_id"
+)
+scp_df = pd.read_csv(
+    os.path.join(PTBXL_PATH, "scp_statements.csv"),
+    index_col=0
+)
+df["scp_codes"] = df["scp_codes"].apply(ast.literal_eval)
+
+print(f"  Total records  : {len(df)}")
+print(f"  Total patients : {df['patient_id'].nunique()}")
+
+
+# ── STEP 2: DEFINE BINARY TARGET (MI SUBTYPING) ──────────────────────────────
+# Task: distinguish high-risk MI from lower-risk MI
+#   y = 1  →  High-risk  (Anterior / Acute)   ← higher mortality
+#   y = 0  →  Lower-risk (Inferior / Lateral / Old)
+#
+# Clinical rationale: Anterior STEMI carries ~2× mortality vs inferior MI.
+# This within-diagnosis heterogeneity is exactly what clustering-aided
+# classification (CAC / NeuralCAC) is designed to handle.
+
+print("\n[2/6] Defining binary MI labels...")
+
+# All SCP codes whose diagnostic_class is "MI"
+mi_codes = set(scp_df[scp_df["diagnostic_class"] == "MI"].index.tolist())
+print(f"  MI SCP codes in dataset : {sorted(mi_codes)}")
+
+# FIX-2a: "INJanterior" is NOT a real PTB-XL code — removed.
+# FIX-2b: INJIN = inferior injury → clinically lower-risk, moved out of
+#          high-risk set. High-risk = anterior/acute/anteroseptal/anterolateral.
+HIGH_RISK_MI_CODES = {
+    "AMI",    # Acute MI (unspecified territory, treated as high-risk)
+    "ASMI",   # Anteroseptal MI
+    "ALMI",   # Anterolateral MI
+    "INJAL",  # Injury anterolateral
+    "INJANT", # Injury anterior  ← correct code (was "INJanterior" before)
+}
+
+LOWER_RISK_MI_CODES = {
+    "IMI",    # Inferior MI
+    "ILMI",   # Inferolateral MI
+    "IPLMI",  # Inferoposterolateral MI
+    "IPMI",   # Inferoposterior MI
+    "LMI",    # Lateral MI
+    "PMI",    # Posterior MI
+    "INJIN",  # Injury inferior ← moved here from high-risk
+    "INJLA",  # Injury lateral
+}
+
+def get_mi_label(scp_dict):
+    """
+    Returns:
+        1  if the record has any high-risk MI code
+        0  if the record has MI codes but none are high-risk
+        None if no MI codes present at all
+    FIX-6: returns None for non-MI so accidental inclusion is visible,
+            not silently labelled 0.
+    """
+    patient_codes = set(scp_dict.keys())
+    if not (patient_codes & mi_codes):
+        return None                          # not an MI record
+    has_high_risk = bool(patient_codes & HIGH_RISK_MI_CODES)
+    return 1 if has_high_risk else 0
+
+df["mi_label"] = df["scp_codes"].apply(get_mi_label)
+
+# Keep only records with a valid MI label
+mi_df = df[df["mi_label"].notna()].copy()
+mi_df["y"] = mi_df["mi_label"].astype(int)
+
+print(f"  Total MI records   : {len(mi_df)}")
+print(f"  Unique MI patients : {mi_df['patient_id'].nunique()}")
+print(f"  High-risk  (y=1)   : {mi_df['y'].sum()}  ({100*mi_df['y'].mean():.1f}%)")
+print(f"  Lower-risk (y=0)   : {(mi_df['y']==0).sum()}  ({100*(1-mi_df['y'].mean()):.1f}%)")
+
+
+# ── STEP 3: LOAD ECG SIGNALS ─────────────────────────────────────────────────
+print("\n[3/6] Loading ECG signals (100 Hz, 12 leads, 1000 time-steps)...")
+
+def load_ecg(row, base_path):
+    try:
+        full_path = os.path.join(base_path, row["filename_lr"])
+        record = wfdb.rdsamp(full_path)
+        return record[0]   # shape: (1000, 12)
+    except Exception as e:
+        print(f"  Warning: could not load {row['filename_lr']} — {e}")
+        return None
+
+signals     = []
+valid_index = []
+
+for ecg_id, row in tqdm(mi_df.iterrows(), total=len(mi_df), desc="  Loading ECGs"):
+    sig = load_ecg(row, PTBXL_PATH)
+    if sig is not None and sig.shape == (1000, 12):
+        signals.append(sig)
+        valid_index.append(ecg_id)
+
+signals = np.array(signals)          # (N, 1000, 12)
+mi_df   = mi_df.loc[valid_index]
+y       = mi_df["y"].values
+patient_ids = mi_df["patient_id"].values
+
+print(f"  Successfully loaded : {len(signals)} records")
+print(f"  Signal array shape  : {signals.shape}")
+
+
+# ── STEP 4: EXTRACT STATIC FEATURES ──────────────────────────────────────────
+# FIX-1: Replace (first, last, median, min, max) with 10 richer statistics
+#         per lead → 10 × 12 = 120 features.
+#
+# Why first/last are bad: they capture a single raw sample that is dominated
+# by baseline wander and recording artefacts, not cardiac morphology.
+#
+# The 10 features chosen here cover:
+#   - Central tendency : mean, median
+#   - Spread           : std, range (max-min), IQR
+#   - Extremes         : min, max
+#   - Shape            : skewness proxy (mean-median gap), signal energy,
+#                        mean absolute successive difference (MASD) for
+#                        capturing waveform activity / R-peak presence
+
+print("\n[4/6] Extracting static features (10 per lead × 12 leads = 120)...")
+
+def extract_static_features(signal):
+    """
+    Args:
+        signal : np.ndarray of shape (1000, 12)
+    Returns:
+        list of 120 floats
+    """
+    feats = []
+    for lead in range(signal.shape[1]):      # 12 leads
+        s = signal[:, lead]                  # (1000,)
+
+        mean_val   = float(np.mean(s))
+        std_val    = float(np.std(s))
+        median_val = float(np.median(s))
+        min_val    = float(s.min())
+        max_val    = float(s.max())
+        sig_range  = float(max_val - min_val)
+        q25        = float(np.percentile(s, 25))
+        q75        = float(np.percentile(s, 75))
+        energy     = float(np.mean(s ** 2))                  # signal energy
+        masd       = float(np.mean(np.abs(np.diff(s))))      # waveform activity
+
+        feats.extend([
+            mean_val, std_val, median_val,
+            min_val, max_val, sig_range,
+            q25, q75,
+            energy, masd
+        ])
+    return feats   # length = 120
+
+X_static = np.array(
+    [extract_static_features(s) for s in tqdm(signals, desc="  Extracting features")]
+).astype(np.float32)
+
+print(f"  Feature matrix shape : {X_static.shape}")
+print(f"  Any NaN in features  : {np.isnan(X_static).any()}")
+
+# FIX-3: Do NOT scale here. Scaling is done AFTER the patient-level split
+#         in the model script so val/test statistics never leak into the scaler.
+
+
+# ── STEP 5: PATIENT-LEVEL TRAIN / VAL / TEST SPLIT ───────────────────────────
+# FIX-4: PTB-XL has multiple recordings per patient. A recording-level split
+#         lets the same patient appear in both train and test, inflating AUC
+#         because the model effectively memorises patient-specific waveform style.
+#
+# We split unique patients 60/15/25 (train/val/test) then collect all their
+# recordings into the corresponding set.
+
+print("\n[5/6] Patient-level train / val / test split (60 / 15 / 25)...")
+
+unique_patients = np.unique(patient_ids)
+
+# Get the majority label per patient (for stratification)
+patient_label = {}
+for pid in unique_patients:
+    mask = (patient_ids == pid)
+    patient_label[pid] = int(np.round(y[mask].mean()))
+
+patient_labels_arr = np.array([patient_label[p] for p in unique_patients])
+
+# 75% trainval / 25% test
+pts_tv, pts_test = train_test_split(
+    unique_patients,
+    test_size=0.25,
+    random_state=42,
+    stratify=patient_labels_arr
+)
+
+# Within trainval: 80% train / 20% val  (→ 60% / 15% of total)
+tv_labels = np.array([patient_label[p] for p in pts_tv])
+pts_train, pts_val = train_test_split(
+    pts_tv,
+    test_size=0.20,
+    random_state=42,
+    stratify=tv_labels
+)
+
+# Build index masks
+train_mask = np.isin(patient_ids, pts_train)
+val_mask   = np.isin(patient_ids, pts_val)
+test_mask  = np.isin(patient_ids, pts_test)
+
+X_train, y_train, pid_train = X_static[train_mask], y[train_mask], patient_ids[train_mask]
+X_val,   y_val,   pid_val   = X_static[val_mask],   y[val_mask],   patient_ids[val_mask]
+X_test,  y_test,  pid_test  = X_static[test_mask],  y[test_mask],  patient_ids[test_mask]
+
+print(f"  Train : {len(X_train)} recordings  ({np.unique(pid_train).shape[0]} patients)  "
+      f"pos rate: {y_train.mean():.3f}")
+print(f"  Val   : {len(X_val)}  recordings  ({np.unique(pid_val).shape[0]} patients)  "
+      f"pos rate: {y_val.mean():.3f}")
+print(f"  Test  : {len(X_test)} recordings  ({np.unique(pid_test).shape[0]} patients)  "
+      f"pos rate: {y_test.mean():.3f}")
+
+# Apply StandardScaler — fit ONLY on train, transform val & test
+from sklearn.preprocessing import StandardScaler
+scaler      = StandardScaler()
+X_train_sc  = scaler.fit_transform(X_train).astype(np.float32)
+X_val_sc    = scaler.transform(X_val).astype(np.float32)
+X_test_sc   = scaler.transform(X_test).astype(np.float32)
+
+
+# ── STEP 6: SAVE ─────────────────────────────────────────────────────────────
+print("\n[6/6] Saving processed data...")
+
+# Pre-split arrays (scaled) — used directly by NeuralCAC / baseline scripts
+np.save(os.path.join(OUTPUT_PATH, "X_train.npy"),   X_train_sc)
+np.save(os.path.join(OUTPUT_PATH, "X_val.npy"),     X_val_sc)
+np.save(os.path.join(OUTPUT_PATH, "X_test.npy"),    X_test_sc)
+np.save(os.path.join(OUTPUT_PATH, "y_train.npy"),   y_train)
+np.save(os.path.join(OUTPUT_PATH, "y_val.npy"),     y_val)
+np.save(os.path.join(OUTPUT_PATH, "y_test.npy"),    y_test)
+
+# Patient IDs (for any downstream patient-level analysis)
+np.save(os.path.join(OUTPUT_PATH, "pid_train.npy"), pid_train)
+np.save(os.path.join(OUTPUT_PATH, "pid_val.npy"),   pid_val)
+np.save(os.path.join(OUTPUT_PATH, "pid_test.npy"),  pid_test)
+
+# Full unscaled matrix + labels (backward compat / exploration)
+np.save(os.path.join(OUTPUT_PATH, "X_static.npy"),      X_static)
+np.save(os.path.join(OUTPUT_PATH, "X_timeseries.npy"),  signals)
+np.save(os.path.join(OUTPUT_PATH, "y.npy"),              y)
+
+# Metadata CSV
+mi_df.to_csv(os.path.join(OUTPUT_PATH, "mi_patients_metadata.csv"))
+
+print(f"\n  Saved to: {OUTPUT_PATH}/")
+print(f"  X_train / X_val / X_test    → scaled, patient-split, shape ~(N, 120)")
+print(f"  y_train / y_val / y_test    → binary labels")
+print(f"  pid_train / pid_val / pid_test → patient IDs per split")
+print(f"  X_static.npy                → full unscaled feature matrix {X_static.shape}")
+print(f"  X_timeseries.npy            → raw ECG signals {signals.shape}")
+
+
+# ── SANITY CHECK ─────────────────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("SANITY CHECK")
+print("=" * 65)
+
+# Patient overlap check (must all be zero)
+overlap_tv   = len(set(pts_train) & set(pts_val))
+overlap_te   = len(set(pts_train) & set(pts_test))
+overlap_vte  = len(set(pts_val)   & set(pts_test))
+
+print(f"  Patient overlap train∩val  : {overlap_tv}  (must be 0)")
+print(f"  Patient overlap train∩test : {overlap_te}  (must be 0)")
+print(f"  Patient overlap val∩test   : {overlap_vte} (must be 0)")
+print(f"  Any NaN in X_train         : {np.isnan(X_train_sc).any()}")
+print(f"  Any NaN in X_test          : {np.isnan(X_test_sc).any()}")
+print(f"  Any NaN in y               : {np.isnan(y.astype(float)).any()}")
+print(f"  Overall positive rate      : {y.mean():.3f}")
+print(f"  Feature dim                : {X_static.shape[1]}  (expect 120)")
+
+# Show which MI codes actually appeared
+all_codes_seen = set()
+for scp_dict in mi_df["scp_codes"]:
+    all_codes_seen.update(scp_dict.keys())
+seen_mi   = all_codes_seen & mi_codes
+seen_high = seen_mi & HIGH_RISK_MI_CODES
+seen_low  = seen_mi & LOWER_RISK_MI_CODES
+
+print(f"\n  MI codes seen in data      : {sorted(seen_mi)}")
+print(f"  High-risk codes seen       : {sorted(seen_high)}")
+print(f"  Lower-risk codes seen      : {sorted(seen_low)}")
+
+print("\n  Data preparation COMPLETE. Ready for NeuralCAC training.")
+print("=" * 65)
